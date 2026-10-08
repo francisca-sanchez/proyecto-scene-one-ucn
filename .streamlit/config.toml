@@ -3,10 +3,13 @@
 primaryColor = "#412206"
 
 # Color de fondo de la página principal
-backgroundColor = "#efc6d4"
+backgroundColor = "#121212"
 
 # Color de fondo secundario (para la barra lateral o cajitas)
-secondaryBackgroundColor = "#f7e0d5"
+secondaryBackgroundColor = "#2B2622"
 
 # Color de las letras
-textColor = "#412206"
+textColor = "#E0E0E0"
+
+# Tipo de letra 
+font = "sans serif"
