@@ -1,0 +1,12 @@
+[theme]
+# Color principal (para botones, barras de carga, etc)
+primaryColor = "#412206"
+
+# Color de fondo de la página principal
+backgroundColor = "#efc6d4"
+
+# Color de fondo secundario (para la barra lateral o cajitas)
+secondaryBackgroundColor = "#f7e0d5"
+
+# Color de las letras
+textColor = "#412206"
