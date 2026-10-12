@@ -13,3 +13,6 @@ textColor = "#E0E0E0"
 
 # Tipo de letra 
 font = "sans serif"
+
+#color botones
+button = "#8B4513"
