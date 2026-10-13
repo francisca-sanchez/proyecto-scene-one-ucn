@@ -2,6 +2,7 @@ import streamlit as st
 from PIL import Image
 import json  
 import os    
+from database.conexion import obtener_inventario
 
 
 #configuracion del logo de la pestana
@@ -12,15 +13,8 @@ img = Image.open("assets/LogoOficialSceneOne.png")
 st.set_page_config(page_title="Scene One", page_icon=img, layout="wide", initial_sidebar_state="collapsed")
 
 
-#base de datos temporal de productos (simulando lo que vendría de Supabase)
-productos_bd = [
-    {"id": 1, "nombre": "Polera Drop Negro", "precio": 25000, "tallas": ["S", "M", "L", "XL"]},
-    {"id": 2, "nombre": "Polerón Classic", "precio": 35000, "tallas": ["M", "L"]},
-    {"id": 3, "nombre": "Jockey Scene One", "precio": 15000, "tallas": ["Única"]},
-    {"id": 4, "nombre": "Tote Bag Logo", "precio": 12000, "tallas": ["Única"]},
-    {"id": 5, "nombre": "Polera Oversize Blanca", "precio": 25000, "tallas": ["S", "M", "L"]},
-    {"id": 6, "nombre": "Calcetines Urban", "precio": 8000, "tallas": ["Única"]}
-]
+# conextar la base de datos
+productos_bd = obtener_inventario()
 
 
 # Inicializar la "memoria" para saber si seleccionaron un producto
@@ -90,7 +84,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 
-# 3. BARRA LATERAL
+#  BARRA LATERAL
 with st.sidebar:
     st.title("Panel Scene One")
     
@@ -134,7 +128,7 @@ with st.sidebar:
             st.rerun()
 
 
-# 4. PANTALLA PRINCIPAL: PUNTO DE VENTA
+#  PANTALLA PRINCIPAL: PUNTO DE VENTA
 if menu == "Punto de Venta":
     
     # El banner ahora usa el color guardado en la memoria
@@ -169,7 +163,7 @@ if menu == "Punto de Venta":
                     st.rerun() # Recarga la página para mostrar el cuadro de abajo
 
     # ----------------------------------------------------
-    # 5. ZONA DE COBRO (Aparece SOLO si se seleccionó un producto)
+    #  ZONA DE COBRO (Aparece SOLO si se seleccionó un producto)
     # ----------------------------------------------------
     if st.session_state.producto_seleccionado is not None:
         st.markdown("---") # Línea divisoria
@@ -182,8 +176,11 @@ if menu == "Punto de Venta":
         
         with col_pago1:
             st.info(f"**Producto:** {prod_actual['nombre']}")
-            # Mostrar desplegable con las tallas de ese producto específico
-            talla_elegida = st.selectbox("Talla a vender:", prod_actual["tallas"])
+            
+            # NUEVO: Cortamos el texto "S, M, L" por las comas para crear una lista
+            lista_tallas = prod_actual["tallas"].split(",")
+            talla_elegida = st.selectbox("Talla a vender:", lista_tallas)
+            
             metodo = st.selectbox("Método de pago:", ["Transferencia", "Efectivo"])
             
         with col_pago2:
