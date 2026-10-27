@@ -3,7 +3,9 @@ SCENE ONE - Tienda de reservas + Panel de gestión (Streamlit + Supabase)
 Ejecutar con:  streamlit run app.py
 """
 import re
+import smtplib
 import uuid
+from email.message import EmailMessage
 import html as html_lib
 from urllib.parse import quote_plus
 from pathlib import Path
@@ -48,7 +50,7 @@ DEFAULT_CFG = {
     "logo_url": "",
     "nombre_tienda": NOMBRE_TIENDA,
     "texto_catalogo": "",
-    "mensaje_reserva": "¡Listo {nombre}! Tu reserva quedó registrada. Te escribiremos por Instagram.",
+    "mensaje_reserva": "¡Listo {nombre}! Tu reserva quedó registrada.",
     "instagram": INSTAGRAM,
     "tiktok": TIKTOK,
     "datos_transferencia": "",
@@ -182,12 +184,12 @@ def crear_reserva(cliente, instagram, email, nota, carrito, adelanto="", pagos=N
         db.table("productos").update({"stock": nuevo}).eq("id", it["id"]).execute()
     items = list(carrito.values())
     total = sum(i["precio"] * i["cantidad"] for i in items)
-    db.table("reservas").insert({
+    reserva = db.table("reservas").insert({
         "cliente": cliente, "instagram": instagram or None, "email": email or None, "nota": nota or None,
         "items": items, "total": total, "estado": "pendiente",
         "adelanto": adelanto or None, "pagos": pagos or [],
-    }).execute()
-    return True, "ok"
+    }).execute().data[0]
+    return True, reserva
 
 
 def normalizar_instagram(v):
@@ -284,6 +286,100 @@ def concretar_reserva(reserva, pagos):
         return None, err
     db.table("reservas").update({"estado": "vendida", "pagos": pagos}).eq("id", reserva["id"]).execute()
     return compra, None
+
+
+def correo_valido(v):
+    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", (v or "").strip()))
+
+
+def enviar_correo(destino, asunto, texto, html):
+    """Envía un correo por SMTP. Devuelve True si salió; False si no está configurado o falló."""
+    try:
+        host, usuario, clave = st.secrets.get("SMTP_HOST"), st.secrets.get("SMTP_USER"), st.secrets.get("SMTP_PASSWORD")
+        if not (host and usuario and clave):
+            print("[correo] SMTP no configurado en secrets.toml: no se envió el correo.")
+            return False
+        puerto = int(st.secrets.get("SMTP_PORT", 465))
+        remitente = st.secrets.get("SMTP_FROM", usuario)
+        msg = EmailMessage()
+        msg["Subject"], msg["From"], msg["To"] = asunto, f"{NOMBRE_TIENDA} <{remitente}>", destino
+        msg.set_content(texto)
+        msg.add_alternative(html, subtype="html")
+        if puerto == 465:
+            with smtplib.SMTP_SSL(host, puerto, timeout=15) as srv:
+                srv.login(usuario, clave)
+                srv.send_message(msg)
+        else:
+            with smtplib.SMTP(host, puerto, timeout=15) as srv:
+                srv.starttls()
+                srv.login(usuario, clave)
+                srv.send_message(msg)
+        return True
+    except Exception as e:
+        print(f"[correo] no se pudo enviar a {destino}: {e}")
+        return False
+
+
+def boleta_reserva_texto(r):
+    """Texto de la boleta de reserva: sirve para el correo y para copiar y pegar en un mensaje de Instagram."""
+    lineas = [f"{NOMBRE_TIENDA} - Boleta de reserva N° {r['id']:06d}", f"Cliente: {r['cliente']}", ""]
+    for it in r["items"]:
+        lineas.append(f"- {it['cantidad']} x {it['nombre']} (talla {it.get('talla') or 'única'}): {money(it['precio'] * it['cantidad'])}")
+    lineas += ["", f"Total: {money(r['total'])}", "Pago: al retirar en tienda (efectivo o transferencia).",
+               "Presenta esta boleta al retirar tus prendas."]
+    return "\n".join(lineas)
+
+
+def boleta_reserva_html(r):
+    esc = html_lib.escape
+    fecha = pd.to_datetime(r["creado_en"], utc=True).tz_convert("America/Santiago").strftime("%d-%m-%Y %H:%M")
+    filas = "".join(
+        f"<tr><td>{esc(str(it['nombre']))} (talla {esc(str(it.get('talla') or 'única'))})</td>"
+        f"<td style='text-align:center'>{it['cantidad']}</td>"
+        f"<td style='text-align:right'>{money(it['precio'] * it['cantidad'])}</td></tr>" for it in r["items"])
+    datos = f"<b>Cliente:</b> {esc(r.get('cliente') or '')}<br>"
+    if r.get("instagram"):
+        datos += f"<b>Instagram:</b> @{esc(r['instagram'])}<br>"
+    if r.get("email"):
+        datos += f"<b>Correo:</b> {esc(r['email'])}<br>"
+    return (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        f"<title>Boleta de reserva N° {r['id']:06d}</title></head>"
+        "<body style=\"font-family:Arial,sans-serif;max-width:520px;margin:24px auto;padding:0 16px;color:#111;background:#fff;\">"
+        f"<h2 style='margin:0'>{esc(NOMBRE_TIENDA)}</h2>"
+        f"<p style='margin:4px 0 16px;color:#555'>Boleta de reserva N° {r['id']:06d}<br>{fecha}</p>"
+        f"<p>{datos}</p>"
+        "<table style='width:100%;border-collapse:collapse' cellpadding='6'>"
+        "<tr style='border-bottom:1px solid #999'><th style='text-align:left'>Detalle</th><th>Cant.</th>"
+        "<th style='text-align:right'>Subtotal</th></tr>"
+        f"{filas}"
+        f"<tr style='border-top:2px solid #111'><td colspan='2'><b>TOTAL</b></td>"
+        f"<td style='text-align:right'><b>{money(r['total'])}</b></td></tr></table>"
+        "<p style='margin-top:18px'><b>Pago:</b> al retirar en tienda (efectivo o transferencia).</p>"
+        "<p style='color:#555;font-size:13px'>Presenta esta boleta al retirar tus prendas.</p>"
+        "</body></html>")
+
+
+def enviar_boleta_reserva(r):
+    return enviar_correo(r["email"], f"Tu reserva N° {r['id']:06d} - {NOMBRE_TIENDA}",
+                         boleta_reserva_texto(r), boleta_reserva_html(r))
+
+
+def mostrar_boleta_reserva():
+    """Boleta de la reserva que acaba de hacer el cliente (con descarga)."""
+    r = st.session_state.get("ultima_reserva")
+    if not r:
+        return
+    with st.container(border=True):
+        st.markdown(f"**Boleta de reserva N° {r['id']:06d}** · Total {money(r['total'])}")
+        b1, b2 = st.columns(2)
+        b1.download_button("Descargar boleta", data=boleta_reserva_html(r), file_name=f"boleta_reserva_{r['id']:06d}.html",
+                           mime="text/html", key="dl_boleta_res", use_container_width=True)
+        if b2.button("Cerrar", key="cerrar_boleta_res", use_container_width=True):
+            st.session_state.pop("ultima_reserva", None)
+            st.rerun()
+        with st.expander("Ver boleta"):
+            components.html(boleta_reserva_html(r), height=420, scrolling=True)
 
 
 def comprobante_html(c):
@@ -495,14 +591,17 @@ def catalogo(cfg):
                 talla = st.selectbox("Talla", tallas, key=k)
                 p = por_talla[talla]
                 st.markdown(f"<div class='precio'>{money(p['precio'])}</div>", unsafe_allow_html=True)
-                if st.button("Agregar a mi reserva", key=f"add_{p['id']}", use_container_width=True):
-                    ya = carrito.get(p["id"], {}).get("cantidad", 0)
-                    if ya + 1 > p["stock"]:
-                        st.toast("No quedan más unidades de esa talla")
-                    else:
+                ya = carrito.get(p["id"], {}).get("cantidad", 0)
+                disponible = a_int(p["stock"]) - ya           # el cliente no ve el stock, solo no puede pasarse de él
+                if disponible <= 0:
+                    st.caption("Ya tienes en tu reserva todas las unidades disponibles de esta talla.")
+                else:
+                    cantidad = st.number_input("Cantidad", min_value=1, max_value=disponible, value=1, step=1,
+                                               key=f"cant_{p['id']}_{disponible}")
+                    if st.button("Agregar a mi reserva", key=f"add_{p['id']}", use_container_width=True):
                         carrito[p["id"]] = {"id": p["id"], "nombre": p["nombre"], "talla": p.get("talla"),
-                                            "precio": p["precio"], "cantidad": ya + 1}
-                        st.toast(f"{p['nombre']} (talla {talla}) agregado")
+                                            "precio": p["precio"], "cantidad": ya + int(cantidad)}
+                        st.toast(f"{int(cantidad)} × {p['nombre']} (talla {talla}) agregado")
                         st.rerun()
 
 
@@ -514,6 +613,7 @@ def vista_tienda(cfg):
 
     if st.session_state.get("reserva_ok"):
         st.success(st.session_state.pop("reserva_ok"))
+    mostrar_boleta_reserva()
     n_prendas = sum(i["cantidad"] for i in carrito.values())
     if n_prendas:
         st.caption(f"Prendas en tu reserva: {n_prendas}. Revísala en la pestaña 'Mi reserva'.")
@@ -538,51 +638,37 @@ def vista_tienda(cfg):
 
             n = st.session_state.setdefault("res_n", 0)        # cambia al reservar, para limpiar el formulario
             nombre = st.text_input("Nombre y apellido *", key=f"res_nombre_{n}")
+            mail = st.text_input("Correo *", placeholder="tucorreo@ejemplo.com", key=f"res_mail_{n}",
+                                 help="Te enviaremos la boleta de tu reserva a este correo")
             ig = st.text_input("Tu usuario de Instagram (opcional)", placeholder="@tuusuario", key=f"res_ig_{n}")
-            mail = st.text_input("Correo (opcional)", key=f"res_mail_{n}")
             nota = st.text_area("Comentario (opcional)", placeholder="Ej: retiro el sábado en la tarde", key=f"res_nota_{n}")
-            pago = st.radio("¿Cómo quieres pagar?", ["Pago al retirar", "Pagar por adelantado"], key=f"res_pago_{n}")
-            adelanto, comp, monto = "", None, total
-            if pago == "Pagar por adelantado":
-                adelanto = st.radio("Método de pago adelantado", ["Transferencia", "Efectivo"], horizontal=True, key=f"res_met_{n}")
-                if adelanto == "Transferencia":
-                    if cfg.get("datos_transferencia"):
-                        st.info(cfg["datos_transferencia"].replace("\n", "  \n"))
-                    monto = st.number_input("Monto que transferiste (CLP)", min_value=0, step=500, value=int(total),
-                                            key=f"res_monto_{n}_{total}")
-                    comp = st.file_uploader("Comprobante de la transferencia (foto o captura)",
-                                            type=["png", "jpg", "jpeg", "webp"], key=f"res_comp_{n}")
-                else:
-                    st.caption("Pagarás en efectivo antes de retirar; el equipo registrará tu pago.")
-            else:
-                st.caption("Reservas ahora y pagas al retirar (efectivo o transferencia).")
+            st.caption("Reservas ahora y pagas al retirar en tienda (efectivo o transferencia).")
 
             if st.button("CONFIRMAR RESERVA", use_container_width=True, key=f"res_enviar_{n}"):
                 if not nombre.strip():
                     st.warning("Falta tu nombre y apellido.")
-                elif adelanto == "Transferencia" and not comp:
-                    st.warning("Sube la captura del comprobante de tu transferencia, o elige pagar al retirar.")
+                elif not correo_valido(mail):
+                    st.warning("Escribe un correo válido: ahí te enviaremos la boleta de tu reserva.")
                 else:
                     try:
-                        pagos = []
-                        if adelanto == "Transferencia":
-                            pagos.append({"metodo": "Transferencia", "monto": a_int(monto),
-                                          "url": subir_imagen(comp, "comprobantes"), "fecha": ahora(),
-                                          "verificado": False, "origen": "cliente"})
-                        ok, msg = crear_reserva(nombre.strip(), normalizar_instagram(ig), mail.strip(), nota.strip(),
-                                                carrito, adelanto, pagos)
+                        ok, res = crear_reserva(nombre.strip(), normalizar_instagram(ig), mail.strip(), nota.strip(), carrito)
                     except Exception as e:
-                        ok, msg = False, f"No se pudo registrar la reserva. Detalle técnico: {e}"
+                        ok, res = False, f"No se pudo registrar la reserva. Detalle técnico: {e}"
                     if ok:
                         texto = (cfg.get("mensaje_reserva") or "Reserva registrada.").replace("{nombre}", nombre.strip().split()[0])
-                        if adelanto == "Transferencia":
-                            texto += " Revisaremos tu comprobante."
+                        if enviar_boleta_reserva(res):
+                            texto += f" Te enviamos la boleta a {mail.strip()}."
+                        else:
+                            texto += " No pudimos enviar el correo, pero puedes descargar tu boleta aquí abajo."
+                        if normalizar_instagram(ig):
+                            texto += " También te escribiremos por Instagram."
                         st.session_state.reserva_ok = texto
+                        st.session_state.ultima_reserva = res
                         st.session_state.carrito = {}
                         st.session_state.res_n = n + 1
                         st.rerun()
                     else:
-                        st.error(msg)
+                        st.error(res)
 
 
 # ----------------------------------------------------------------------
@@ -623,7 +709,11 @@ def admin_reservas():
             if r.get("adelanto"):
                 st.write(f"Forma de pago elegida: adelantado por {r['adelanto'].lower()}")
             else:
-                st.write("Forma de pago elegida: paga al retirar")
+                st.write("Forma de pago: al retirar")
+            st.download_button("Descargar boleta de reserva", data=boleta_reserva_html(r),
+                               file_name=f"boleta_reserva_{r['id']:06d}.html", mime="text/html", key=f"bol_{r['id']}")
+            if st.checkbox("Mostrar el texto de la boleta para copiarlo (por ejemplo, para enviarlo por Instagram)", key=f"txt_{r['id']}"):
+                st.code(boleta_reserva_texto(r), language=None)
 
             if estado != "pendiente":
                 mostrar_pagos(pagos)
@@ -654,13 +744,16 @@ def admin_reservas():
             elif falta > 0:
                 st.info(f"Falta {money(falta)}. Si el depósito fue menor, pide al cliente que deposite el resto, "
                         "o registra aquí el pago apenas lo recibas.")
-                with st.form(f"pago_{r['id']}", clear_on_submit=True):
-                    metodo_p = st.radio("Método de pago", ["Efectivo", "Transferencia"], horizontal=True, key=f"pm_{r['id']}")
-                    monto_p = st.number_input("Monto recibido (CLP)", min_value=0, step=500, value=int(falta), key=f"pmo_{r['id']}")
+                nk = st.session_state.setdefault(f"pago_n_{r['id']}", 0)     # cambia al registrar, para limpiar los campos
+                metodo_p = st.radio("Método de pago", ["Efectivo", "Transferencia"], horizontal=True, key=f"pm_{r['id']}_{nk}")
+                monto_p = st.number_input("Monto recibido (CLP)", min_value=0, step=500, value=int(falta),
+                                          key=f"pmo_{r['id']}_{nk}_{falta}")
+                comp = None
+                if metodo_p == "Transferencia":
+                    st.caption("Revisa en la cuenta de la tienda que el depósito llegó y sube aquí la captura.")
                     comp = st.file_uploader("Comprobante de la transferencia (foto o captura)",
-                                            type=["png", "jpg", "jpeg", "webp"], key=f"pc_{r['id']}")
-                    ok_p = st.form_submit_button("Registrar pago", use_container_width=True)
-                if ok_p:
+                                            type=["png", "jpg", "jpeg", "webp"], key=f"pc_{r['id']}_{nk}")
+                if st.button("Registrar pago", key=f"pg_{r['id']}_{nk}", use_container_width=True):
                     if a_int(monto_p) <= 0:
                         st.warning("El monto debe ser mayor a 0.")
                     elif metodo_p == "Transferencia" and not comp:
@@ -671,6 +764,7 @@ def admin_reservas():
                             pagos.append({"metodo": metodo_p, "monto": a_int(monto_p), "url": url, "fecha": ahora(),
                                           "verificado": True, "origen": "admin"})
                             guardar_pagos(r["id"], pagos)
+                            st.session_state[f"pago_n_{r['id']}"] = nk + 1
                             st.session_state.flash = "Pago registrado"
                             st.rerun()
                         except Exception as e:
@@ -1127,9 +1221,6 @@ def admin_diseno(cfg):
                                            cfg["texto_catalogo"], height=100)
     nuevo["mensaje_reserva"] = st.text_area("Mensaje al confirmar una reserva (usa {nombre} para el nombre del cliente)",
                                             cfg["mensaje_reserva"], height=80)
-    nuevo["datos_transferencia"] = st.text_area("Datos para transferir (se muestran al cliente que elige pagar por adelantado con transferencia)",
-                                                cfg["datos_transferencia"], height=100,
-                                                placeholder="Banco, tipo de cuenta, número, nombre, RUT y correo")
     nuevo["instagram"] = st.text_input("Link de Instagram (vacío = no mostrar el ícono)", cfg["instagram"])
     nuevo["tiktok"] = st.text_input("Link de TikTok (vacío = no mostrar el ícono)", cfg["tiktok"])
 
@@ -1186,7 +1277,7 @@ if "flash" in st.session_state:
 with st.sidebar:
     st.markdown(f"## {'Panel ' if st.session_state.admin else ''}{cfg['nombre_tienda']}")
     if not st.session_state.admin:
-        st.caption("Reserva tus prendas y retíralas en tienda.")
+        st.caption("Reserva tus prendas")
         with st.expander("Acceso administrador"):
             with st.form("login"):
                 correo = st.text_input("Correo")
