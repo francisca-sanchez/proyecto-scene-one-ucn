@@ -49,7 +49,6 @@ DEFAULT_CFG = {
     "banner_url": "",
     "logo_url": "",
     "nombre_tienda": NOMBRE_TIENDA,
-    "texto_catalogo": "",
     "mensaje_reserva": "¡Listo {nombre}! Tu reserva quedó registrada.",
     "instagram": INSTAGRAM,
     "tiktok": TIKTOK,
@@ -549,8 +548,6 @@ def catalogo(cfg):
     """Catálogo: se vuelve a leer de la base de datos cada 15 segundos, así lo que se cambia
     en Inventario (productos nuevos, precios, stock, fotos) aparece solo, sin recargar la página."""
     carrito = st.session_state.carrito
-    if cfg.get("texto_catalogo"):
-        st.markdown(cfg["texto_catalogo"])
     todos = listar_productos(False)
     prods = [p for p in todos if p.get("activo", True) and p["stock"] > 0]
     if st.session_state.get("admin") and len(todos) > len(prods):
@@ -642,7 +639,7 @@ def vista_tienda(cfg):
                                  help="Te enviaremos la boleta de tu reserva a este correo")
             ig = st.text_input("Tu usuario de Instagram (opcional)", placeholder="@tuusuario", key=f"res_ig_{n}")
             nota = st.text_area("Comentario (opcional)", placeholder="Ej: retiro el sábado en la tarde", key=f"res_nota_{n}")
-            st.caption("Reservas ahora y pagas al retirar en tienda (efectivo o transferencia).")
+            st.caption("Reservas ahora y coordinamos para la entrega")
 
             if st.button("CONFIRMAR RESERVA", use_container_width=True, key=f"res_enviar_{n}"):
                 if not nombre.strip():
@@ -706,20 +703,15 @@ def admin_reservas():
                 st.write(f"Nota: {r['nota']}")
             for it in r["items"]:
                 st.write(f"- {it['cantidad']} × {it['nombre']} (talla {it.get('talla') or 'única'}) — {money(it['precio'] * it['cantidad'])}")
-            if r.get("adelanto"):
-                st.write(f"Forma de pago elegida: adelantado por {r['adelanto'].lower()}")
-            else:
-                st.write("Forma de pago: al retirar")
             st.download_button("Descargar boleta de reserva", data=boleta_reserva_html(r),
                                file_name=f"boleta_reserva_{r['id']:06d}.html", mime="text/html", key=f"bol_{r['id']}")
-            if st.checkbox("Mostrar el texto de la boleta para copiarlo (por ejemplo, para enviarlo por Instagram)", key=f"txt_{r['id']}"):
-                st.code(boleta_reserva_texto(r), language=None)
+
+            st.markdown(f"### Total: {money(total)}")
 
             if estado != "pendiente":
                 mostrar_pagos(pagos)
                 continue
 
-            st.markdown(f"**Total de la reserva: {money(total)}**  ·  Pago verificado: {money(verificado)}  ·  Falta: {money(falta)}")
             for i, pg in enumerate(pagos):
                 with st.container(border=True):
                     mostrar_pagos([pg])
@@ -742,8 +734,6 @@ def admin_reservas():
             if sin_verificar:
                 st.caption("Verifica o descarta los comprobantes de arriba antes de registrar otro pago o confirmar la venta.")
             elif falta > 0:
-                st.info(f"Falta {money(falta)}. Si el depósito fue menor, pide al cliente que deposite el resto, "
-                        "o registra aquí el pago apenas lo recibas.")
                 nk = st.session_state.setdefault(f"pago_n_{r['id']}", 0)     # cambia al registrar, para limpiar los campos
                 metodo_p = st.radio("Método de pago", ["Efectivo", "Transferencia"], horizontal=True, key=f"pm_{r['id']}_{nk}")
                 monto_p = st.number_input("Monto recibido (CLP)", min_value=0, step=500, value=int(falta),
@@ -1009,8 +999,6 @@ def admin_inventario():
 
     with tab2:
         st.subheader("Ingresar nueva mercadería")
-        st.caption("Para agregar otra talla de una prenda que ya existe, elígela en la primera lista: se copian su categoría, "
-                   "precio y foto (puedes cambiarlos). Si esa talla ya existía, el stock se suma al que ya está.")
         todos = listar_productos(False)
         existentes = sorted({p["nombre"] for p in todos if p.get("nombre")}, key=str.lower)
         with st.form("nuevo_producto", clear_on_submit=True):
@@ -1024,16 +1012,14 @@ def admin_inventario():
                                      help="Si eliges una prenda que ya existe y lo dejas en 0, se usa su precio")
             stock = c1.number_input("Stock inicial", step=1, value=1)
             foto = c2.file_uploader("Foto o archivo")
-            otra_cat = c1.text_input("¿Otra categoría? (opcional)", placeholder="Solo si no está en la lista")
-            otra_talla = c2.text_input("¿Otra talla? (opcional)", placeholder="Solo si no está en la lista")
             ok = st.form_submit_button("AGREGAR AL INVENTARIO", use_container_width=True)
         if ok:
             def norm(x):
                 return (x or "").strip().lower()
             nombre_final = nombre.strip() or elegido or "Sin nombre"
             base = next((p for p in todos if norm(p["nombre"]) == norm(nombre_final)), None)
-            categoria = otra_cat.strip() or categoria_sel or ((base.get("categoria") if base else "") or "")
-            talla = otra_talla.strip() or talla_sel
+            categoria = categoria_sel or ((base.get("categoria") if base else "") or "")
+            talla = talla_sel
             precio_final = a_int(precio) or (a_int(base["precio"]) if base else 0)
             url = None
             try:
@@ -1217,8 +1203,6 @@ def admin_diseno(cfg):
     st.caption("Si dejas un texto vacío, simplemente no se muestra.")
     nuevo["titulo"] = st.text_area("Título del banner", cfg["titulo"], height=80)
     nuevo["subtitulo"] = st.text_area("Subtítulo del banner", cfg["subtitulo"], height=80)
-    nuevo["texto_catalogo"] = st.text_area("Texto sobre el catálogo (opcional, acepta **negrita**, enlaces y saltos de línea)",
-                                           cfg["texto_catalogo"], height=100)
     nuevo["mensaje_reserva"] = st.text_area("Mensaje al confirmar una reserva (usa {nombre} para el nombre del cliente)",
                                             cfg["mensaje_reserva"], height=80)
     nuevo["instagram"] = st.text_input("Link de Instagram (vacío = no mostrar el ícono)", cfg["instagram"])
