@@ -5,6 +5,7 @@ Ejecutar con:  streamlit run app.py
 import re
 import smtplib
 import uuid
+from datetime import timedelta
 from email.message import EmailMessage
 import html as html_lib
 from urllib.parse import quote_plus
@@ -172,22 +173,57 @@ def subir_imagen(archivo, carpeta="productos"):
     return db.storage.from_("imagenes").get_public_url(ruta)
 
 
-def crear_reserva(cliente, instagram, email, nota, carrito, adelanto="", pagos=None):
+def validar_descuento(codigo):
+    """Comprueba un código de descuento. Devuelve (descuento, mensaje_de_error)."""
+    cod = re.sub(r"\s+", "", codigo or "").upper()
+    if not cod:
+        return None, "Escribe un código."
+    try:
+        r = db.table("descuentos").select("*").eq("codigo", cod).limit(1).execute().data
+    except Exception:
+        return None, "Los códigos de descuento no están disponibles por ahora."
+    if not r:
+        return None, "Ese código no existe."
+    d = r[0]
+    if not d.get("activo", True):
+        return None, "Ese código no está activo."
+    hoy = pd.Timestamp.now(tz="America/Santiago").date()
+    if d.get("vence") and hoy > pd.to_datetime(d["vence"]).date():
+        return None, "Ese código ya venció."
+    if d.get("cupos_total") is not None and a_int(d.get("usos")) >= a_int(d["cupos_total"]):
+        return None, "Ese código ya no tiene cupos disponibles."
+    return d, None
+
+
+def crear_reserva(cliente, instagram, email, nota, carrito, adelanto="", pagos=None, codigo=None):
     """Descuenta stock (queda 'apartado') y guarda la reserva como pendiente."""
     prods = {p["id"]: p for p in listar_productos(False)}
     for it in carrito.values():
         if prods.get(it["id"], {}).get("stock", 0) < it["cantidad"]:
             return False, f"No hay stock suficiente de {it['nombre']}."
+    items = list(carrito.values())
+    subtotal = sum(i["precio"] * i["cantidad"] for i in items)
+    datos = {
+        "cliente": cliente, "instagram": instagram or None, "email": email or None, "nota": nota or None,
+        "items": items, "estado": "pendiente", "adelanto": adelanto or None, "pagos": pagos or [],
+    }
+    desc = None
+    if codigo:
+        desc, err = validar_descuento(codigo)
+        if err:
+            return False, err
+        monto = int(round(subtotal * desc["porcentaje"] / 100))
+        datos.update({"subtotal": subtotal, "descuento_codigo": desc["codigo"],
+                      "descuento_pct": desc["porcentaje"], "descuento_monto": monto})
+        subtotal -= monto
+    datos["total"] = subtotal
+    # el stock se descuenta solo cuando todo lo anterior salió bien
     for it in carrito.values():
         nuevo = prods[it["id"]]["stock"] - it["cantidad"]
         db.table("productos").update({"stock": nuevo}).eq("id", it["id"]).execute()
-    items = list(carrito.values())
-    total = sum(i["precio"] * i["cantidad"] for i in items)
-    reserva = db.table("reservas").insert({
-        "cliente": cliente, "instagram": instagram or None, "email": email or None, "nota": nota or None,
-        "items": items, "total": total, "estado": "pendiente",
-        "adelanto": adelanto or None, "pagos": pagos or [],
-    }).execute().data[0]
+    reserva = db.table("reservas").insert(datos).execute().data[0]
+    if desc:
+        db.table("descuentos").update({"usos": a_int(desc.get("usos")) + 1}).eq("id", desc["id"]).execute()
     return True, reserva
 
 
@@ -244,10 +280,12 @@ def metodo_resumen(pagos):
     return metodos.pop() if len(metodos) == 1 else "Mixto"
 
 
-def finalizar_compra(items, cliente, instagram, email, nota, pagos, origen, reserva_id=None, descontar_stock=True):
+def finalizar_compra(items, cliente, instagram, email, nota, pagos, origen, reserva_id=None, descontar_stock=True, descuento=None):
     """Crea la compra con sus pagos y comprobantes, las ventas por prenda y actualiza al cliente.
     Devuelve (compra, mensaje_de_error)."""
-    total = sum(a_int(i["precio"]) * a_int(i["cantidad"]) for i in items)
+    subtotal = sum(a_int(i["precio"]) * a_int(i["cantidad"]) for i in items)
+    monto_desc = a_int((descuento or {}).get("monto"))
+    total = subtotal - monto_desc
     try:
         actuales = {}
         if descontar_stock:
@@ -257,19 +295,27 @@ def finalizar_compra(items, cliente, instagram, email, nota, pagos, origen, rese
                 if actuales[it["id"]] < it["cantidad"]:
                     return None, f"No hay stock suficiente de {it['nombre']}."
         cliente_id = registrar_cliente(cliente, instagram, email, total)
-        compra = db.table("compras").insert({
+        datos = {
             "cliente_id": cliente_id, "cliente": cliente, "instagram": normalizar_instagram(instagram) or None,
             "email": email or None, "nota": nota or None, "items": items, "total": total,
             "pagos": pagos, "origen": origen, "reserva_id": reserva_id,
-        }).execute().data[0]
+        }
+        if monto_desc:
+            datos.update({"subtotal": subtotal, "descuento_codigo": descuento.get("codigo"),
+                          "descuento_pct": a_int(descuento.get("pct")), "descuento_monto": monto_desc})
+        compra = db.table("compras").insert(datos).execute().data[0]
         if descontar_stock:
             for it in items:
                 db.table("productos").update({"stock": actuales[it["id"]] - it["cantidad"]}).eq("id", it["id"]).execute()
         metodo = metodo_resumen(pagos)
-        for it in items:
+        lineas = [a_int(i["precio"]) * a_int(i["cantidad"]) for i in items]
+        if monto_desc and subtotal:                         # reparte el descuento entre las prendas
+            lineas = [int(round(x * total / subtotal)) for x in lineas]
+            lineas[-1] += total - sum(lineas)
+        for it, linea in zip(items, lineas):
             db.table("ventas").insert({
                 "producto_id": it["id"], "nombre_producto": it["nombre"], "cantidad": it["cantidad"],
-                "total": a_int(it["precio"]) * a_int(it["cantidad"]), "metodo_pago": metodo,
+                "total": linea, "metodo_pago": metodo,
                 "cliente": cliente, "compra_id": compra["id"],
             }).execute()
         return compra, None
@@ -277,10 +323,57 @@ def finalizar_compra(items, cliente, instagram, email, nota, pagos, origen, rese
         return None, f"No se pudo registrar la venta. Detalle técnico: {e}"
 
 
+def corregir_total_venta(k, nuevo_total, montos, motivo, corte=None):
+    """Cambia el total de una venta ya registrada y deja todo cuadrado: ventas (Finanzas), pagos, ficha del
+    cliente y comprobante. Guarda el registro de la corrección. Devuelve un mensaje de error o None."""
+    antes, nuevo = a_int(k["total"]), a_int(nuevo_total)
+    try:
+        filas = db.table("ventas").select("id,total,creado_en").eq("compra_id", k["id"]).execute().data or []
+        if corte and any(pd.to_datetime(f["creado_en"], utc=True, format="ISO8601") <= pd.to_datetime(corte, utc=True, format="ISO8601")
+                         for f in filas):
+            return "Esa venta pertenece a una tanda ya cerrada. Deshaz el cierre en Finanzas si necesitas corregirla."
+
+        pagos = [dict(pg) for pg in (k.get("pagos") or [])]
+        if len(pagos) == 1:
+            pagos[0]["monto"] = nuevo
+        else:
+            for i, m in (montos or {}).items():
+                pagos[i]["monto"] = a_int(m)
+        subtotal = a_int(k.get("subtotal")) or sum(a_int(i["precio"]) * a_int(i["cantidad"]) for i in k["items"])
+        esperado = subtotal - a_int(k.get("descuento_monto"))
+        ajuste = nuevo - esperado                                   # 0 si el total vuelve a ser el original
+
+        # 1) primero el registro: si falla (tabla sin crear), no se cambia nada
+        db.table("correcciones_venta").insert({
+            "compra_id": k["id"], "cliente": k.get("cliente"), "total_anterior": antes,
+            "total_nuevo": nuevo, "motivo": motivo}).execute()
+        # 2) ventas por prenda (lo que lee Finanzas): se reparte el nuevo total en proporción
+        if filas:
+            viejos = [a_int(f["total"]) for f in filas]
+            suma = sum(viejos)
+            nuevos = [int(round(v * nuevo / suma)) for v in viejos] if suma > 0 else [nuevo] + [0] * (len(filas) - 1)
+            nuevos[-1] += nuevo - sum(nuevos)
+            for f, t in zip(filas, nuevos):
+                db.table("ventas").update({"total": t}).eq("id", f["id"]).execute()
+        # 3) lo gastado por el cliente
+        if k.get("cliente_id"):
+            c = db.table("clientes").select("id,total_gastado").eq("id", k["cliente_id"]).limit(1).execute().data
+            if c:
+                db.table("clientes").update({"total_gastado": max(a_int(c[0].get("total_gastado")) + nuevo - antes, 0)}
+                                            ).eq("id", c[0]["id"]).execute()
+        # 4) la venta y su comprobante
+        db.table("compras").update({"total": nuevo, "pagos": pagos, "ajuste_monto": ajuste}).eq("id", k["id"]).execute()
+        return None
+    except Exception as e:
+        return f"No se pudo corregir la venta. Si dice que falta una tabla o columna, ejecuta actualizacion_correcciones.sql en Supabase. Detalle: {e}"
+
+
 def concretar_reserva(reserva, pagos):
     """La reserva ya está pagada: se convierte en compra (el stock ya estaba descontado)."""
     compra, err = finalizar_compra(reserva["items"], reserva["cliente"], reserva.get("instagram"), reserva.get("email"),
-                                   reserva.get("nota"), pagos, "reserva", reserva["id"], descontar_stock=False)
+                                   reserva.get("nota"), pagos, "reserva", reserva["id"], descontar_stock=False,
+                                   descuento=({"codigo": reserva.get("descuento_codigo"), "pct": reserva.get("descuento_pct"),
+                                               "monto": reserva.get("descuento_monto")} if a_int(reserva.get("descuento_monto")) else None))
     if err:
         return None, err
     db.table("reservas").update({"estado": "vendida", "pagos": pagos}).eq("id", reserva["id"]).execute()
@@ -319,19 +412,42 @@ def enviar_correo(destino, asunto, texto, html):
         return False
 
 
+def money_signado(n):
+    return ("-" if n < 0 else "+") + money(abs(n))
+
+
+def filas_descuento(x):
+    """Filas de subtotal, descuento y ajuste manual para boletas y comprobantes (vacío si no hay nada de eso)."""
+    desc, ajuste = a_int(x.get("descuento_monto")), a_int(x.get("ajuste_monto"))
+    if not desc and not ajuste:
+        return ""
+    subtotal = a_int(x.get("subtotal")) or sum(a_int(i.get("precio")) * a_int(i.get("cantidad")) for i in (x.get("items") or []))
+    filas = f"<tr><td colspan='2'>Subtotal</td><td style='text-align:right'>{money(subtotal)}</td></tr>"
+    if desc:
+        filas += (f"<tr><td colspan='2'>Descuento {html_lib.escape(str(x.get('descuento_codigo') or ''))} "
+                  f"({a_int(x.get('descuento_pct'))}%)</td><td style='text-align:right'>-{money(desc)}</td></tr>")
+    if ajuste:
+        filas += f"<tr><td colspan='2'>Ajuste manual</td><td style='text-align:right'>{money_signado(ajuste)}</td></tr>"
+    return filas
+
+
 def boleta_reserva_texto(r):
     """Texto de la boleta de reserva: sirve para el correo y para copiar y pegar en un mensaje de Instagram."""
     lineas = [f"{NOMBRE_TIENDA} - Boleta de reserva N° {r['id']:06d}", f"Cliente: {r['cliente']}", ""]
     for it in r["items"]:
         lineas.append(f"- {it['cantidad']} x {it['nombre']} (talla {it.get('talla') or 'única'}): {money(it['precio'] * it['cantidad'])}")
-    lineas += ["", f"Total: {money(r['total'])}", "Pago: al retirar en tienda (efectivo o transferencia).",
-               "Presenta esta boleta al retirar tus prendas."]
+    lineas.append("")
+    if a_int(r.get("descuento_monto")):
+        lineas += [f"Subtotal: {money(r['subtotal'])}",
+                   f"Descuento {r.get('descuento_codigo')} ({a_int(r.get('descuento_pct'))}%): -{money(r['descuento_monto'])}"]
+    lineas += [f"Total: {money(r['total'])}", "Coordinaremos contigo la entrega y el pago.",
+               "Guarda esta boleta como respaldo de tu reserva."]
     return "\n".join(lineas)
 
 
 def boleta_reserva_html(r):
     esc = html_lib.escape
-    fecha = pd.to_datetime(r["creado_en"], utc=True).tz_convert("America/Santiago").strftime("%d-%m-%Y %H:%M")
+    fecha = pd.to_datetime(r["creado_en"], utc=True, format="ISO8601").tz_convert("America/Santiago").strftime("%d-%m-%Y %H:%M")
     filas = "".join(
         f"<tr><td>{esc(str(it['nombre']))} (talla {esc(str(it.get('talla') or 'única'))})</td>"
         f"<td style='text-align:center'>{it['cantidad']}</td>"
@@ -351,11 +467,11 @@ def boleta_reserva_html(r):
         "<table style='width:100%;border-collapse:collapse' cellpadding='6'>"
         "<tr style='border-bottom:1px solid #999'><th style='text-align:left'>Detalle</th><th>Cant.</th>"
         "<th style='text-align:right'>Subtotal</th></tr>"
-        f"{filas}"
+        f"{filas}{filas_descuento(r)}"
         f"<tr style='border-top:2px solid #111'><td colspan='2'><b>TOTAL</b></td>"
         f"<td style='text-align:right'><b>{money(r['total'])}</b></td></tr></table>"
-        "<p style='margin-top:18px'><b>Pago:</b> al retirar en tienda (efectivo o transferencia).</p>"
-        "<p style='color:#555;font-size:13px'>Presenta esta boleta al retirar tus prendas.</p>"
+        "<p style='margin-top:18px'>Coordinaremos contigo la entrega y el pago.</p>"
+        "<p style='color:#555;font-size:13px'>Guarda esta boleta como respaldo de tu reserva.</p>"
         "</body></html>")
 
 
@@ -384,7 +500,7 @@ def mostrar_boleta_reserva():
 def comprobante_html(c):
     """Comprobante de compra (HTML): se puede imprimir o guardar como PDF desde el navegador."""
     esc = html_lib.escape
-    fecha = pd.to_datetime(c["creado_en"], utc=True).tz_convert("America/Santiago").strftime("%d-%m-%Y %H:%M")
+    fecha = pd.to_datetime(c["creado_en"], utc=True, format="ISO8601").tz_convert("America/Santiago").strftime("%d-%m-%Y %H:%M")
     filas = "".join(
         f"<tr><td>{esc(str(it['nombre']))} (talla {esc(str(it.get('talla') or 'única'))})</td>"
         f"<td style='text-align:center'>{it['cantidad']}</td>"
@@ -411,7 +527,7 @@ def comprobante_html(c):
         "<table style='width:100%;border-collapse:collapse' cellpadding='6'>"
         "<tr style='border-bottom:1px solid #999'><th style='text-align:left'>Detalle</th><th>Cant.</th>"
         "<th style='text-align:right'>Subtotal</th></tr>"
-        f"{filas}"
+        f"{filas}{filas_descuento(c)}"
         f"<tr style='border-top:2px solid #111'><td colspan='2'><b>TOTAL</b></td>"
         f"<td style='text-align:right'><b>{money(c['total'])}</b></td></tr></table>"
         "<h4 style='margin:18px 0 4px'>Pagos</h4>"
@@ -449,6 +565,13 @@ def cancelar_reserva(reserva):
         if r:
             db.table("productos").update({"stock": r[0]["stock"] + it["cantidad"]}).eq("id", it["id"]).execute()
     db.table("reservas").update({"estado": "cancelada"}).eq("id", reserva["id"]).execute()
+    if reserva.get("descuento_codigo"):                      # el cupo del código vuelve a estar disponible
+        try:
+            d = db.table("descuentos").select("id,usos").eq("codigo", reserva["descuento_codigo"]).limit(1).execute().data
+            if d:
+                db.table("descuentos").update({"usos": max(a_int(d[0].get("usos")) - 1, 0)}).eq("id", d[0]["id"]).execute()
+        except Exception:
+            pass
 
 
 # ----------------------------------------------------------------------
@@ -509,6 +632,10 @@ html, body, .stApp, .stApp button, .stApp input, .stApp textarea {{ font-family:
 [data-testid="stAlert"] svg, [data-testid="stToast"] svg {{ fill: {cfg['color_texto']} !important; }}
 [data-testid="stToast"] {{ background: {cfg['color_lateral']} !important; border: 1px solid rgba({r},{g},{b},.25); }}
 .precio {{ font-size: 1.25rem; font-weight: 800; }}
+.cart-total-label {{ font-size: .85rem; opacity: .7; letter-spacing: .12em; text-transform: uppercase; margin-top: 6px; }}
+.cart-total {{ font-size: 2.6rem; font-weight: 800; line-height: 1.1; margin-bottom: 8px; }}
+.sin-foto-mini {{ background:#e9ecef; color:#6c757d; width:80px; height:100px; border-radius:8px;
+                  display:flex; align-items:center; justify-content:center; font-size:.7rem; font-weight:700; }}
 .sin-foto {{ background:#e9ecef; color:#6c757d; height:260px; border-radius:12px;
              display:flex; align-items:center; justify-content:center; font-weight:700; }}
 </style>
@@ -597,7 +724,8 @@ def catalogo(cfg):
                                                key=f"cant_{p['id']}_{disponible}")
                     if st.button("Agregar a mi reserva", key=f"add_{p['id']}", use_container_width=True):
                         carrito[p["id"]] = {"id": p["id"], "nombre": p["nombre"], "talla": p.get("talla"),
-                                            "precio": p["precio"], "cantidad": ya + int(cantidad)}
+                                            "precio": p["precio"], "cantidad": ya + int(cantidad),
+                                            "imagen_url": p.get("imagen_url") or foto}
                         st.toast(f"{int(cantidad)} × {p['nombre']} (talla {talla}) agregado")
                         st.rerun()
 
@@ -623,32 +751,93 @@ def vista_tienda(cfg):
         if not carrito:
             st.info("Tu reserva está vacía. Agrega prendas desde el catálogo.")
         else:
-            for pid, it in list(carrito.items()):
-                c1, c2, c3 = st.columns([5, 2, 1])
-                c1.markdown(f"**{it['nombre']}** · talla {it.get('talla') or 'única'}")
-                c2.markdown(f"{it['cantidad']} × {money(it['precio'])}")
-                if c3.button("Quitar", key=f"del_{pid}"):
-                    del carrito[pid]
-                    st.rerun()
-            total = sum(i["precio"] * i["cantidad"] for i in carrito.values())
-            st.markdown(f"### Total: {money(total)}")
+            stock_actual = {p["id"]: a_int(p["stock"]) for p in listar_productos(False)}
+            subtotal = sum(i["precio"] * i["cantidad"] for i in carrito.values())
 
+            # Código de descuento aplicado: se vuelve a comprobar cada vez (fecha, cupos, si sigue activo)
+            descuento, monto_desc = None, 0
+            if st.session_state.get("codigo_descuento"):
+                descuento, err = validar_descuento(st.session_state["codigo_descuento"])
+                if err:
+                    st.session_state.pop("codigo_descuento", None)
+                    st.warning(f"Se quitó el código de descuento: {err}")
+                    descuento = None
+                else:
+                    monto_desc = int(round(subtotal * descuento["porcentaje"] / 100))
+            total = subtotal - monto_desc
+
+            izq, der = st.columns([2, 1], gap="large")
             n = st.session_state.setdefault("res_n", 0)        # cambia al reservar, para limpiar el formulario
-            nombre = st.text_input("Nombre y apellido *", key=f"res_nombre_{n}")
-            mail = st.text_input("Correo *", placeholder="tucorreo@ejemplo.com", key=f"res_mail_{n}",
-                                 help="Te enviaremos la boleta de tu reserva a este correo")
-            ig = st.text_input("Tu usuario de Instagram (opcional)", placeholder="@tuusuario", key=f"res_ig_{n}")
-            nota = st.text_area("Comentario (opcional)", placeholder="Ej: retiro el sábado en la tarde", key=f"res_nota_{n}")
-            st.caption("Reservas ahora y coordinamos para la entrega")
+            with izq:
+                st.markdown("### Tu carrito")
+                for pid, it in list(carrito.items()):
+                    with st.container(border=True):
+                        c_foto, c_info, c_cant, c_quitar = st.columns([1, 3, 2, 1])
+                        if it.get("imagen_url"):
+                            c_foto.image(it["imagen_url"], width=80)
+                        else:
+                            c_foto.markdown("<div class='sin-foto-mini'>FOTO</div>", unsafe_allow_html=True)
+                        c_info.markdown(f"**{it['nombre']}**")
+                        c_info.caption(f"Talla {it.get('talla') or 'única'}")
+                        c_info.markdown(f"<span class='precio'>{money(it['precio'])}</span>", unsafe_allow_html=True)
+                        tope = max(stock_actual.get(pid, 0), 1)       # el cliente nunca ve el stock
+                        nueva = c_cant.number_input("Cantidad", min_value=1, max_value=tope, value=min(it["cantidad"], tope),
+                                                    step=1, key=f"cq_{pid}_{it['cantidad']}", label_visibility="collapsed")
+                        if int(nueva) != it["cantidad"]:
+                            it["cantidad"] = int(nueva)
+                            st.rerun()
+                        if c_quitar.button("Quitar", key=f"del_{pid}"):
+                            del carrito[pid]
+                            st.rerun()
 
-            if st.button("CONFIRMAR RESERVA", use_container_width=True, key=f"res_enviar_{n}"):
+                st.markdown("### Tus datos")
+                nombre = st.text_input("Nombre y apellido *", key=f"res_nombre_{n}")
+                mail = st.text_input("Correo *", placeholder="tucorreo@ejemplo.com", key=f"res_mail_{n}",
+                                     help="Te enviaremos la boleta de tu reserva a este correo")
+                ig = st.text_input("Tu usuario de Instagram (opcional)", placeholder="@tuusuario", key=f"res_ig_{n}")
+                nota = st.text_area("Comentario (opcional)", placeholder="Ej: puedo retirar el sábado en la tarde",
+                                    key=f"res_nota_{n}")
+
+            with der:
+                with st.container(border=True):
+                    st.markdown("#### Resumen de la reserva")
+                    f1, f2 = st.columns([3, 2])
+                    f1.write(f"Subtotal ({sum(i['cantidad'] for i in carrito.values())} prendas)")
+                    f2.markdown(f"<div style='text-align:right'>{money(subtotal)}</div>", unsafe_allow_html=True)
+                    if descuento:
+                        g1, g2 = st.columns([3, 2])
+                        g1.write(f"Descuento {descuento['codigo']} ({descuento['porcentaje']}%)")
+                        g2.markdown(f"<div style='text-align:right'>-{money(monto_desc)}</div>", unsafe_allow_html=True)
+                    st.divider()
+                    st.markdown("<div class='cart-total-label'>Total</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='cart-total'>{money(total)}</div>", unsafe_allow_html=True)
+                    if descuento:
+                        st.caption(f"Código aplicado: {descuento['codigo']}")
+                        if st.button("Quitar código", key="quitar_cod", use_container_width=True):
+                            st.session_state.pop("codigo_descuento", None)
+                            st.rerun()
+                    else:
+                        cod = st.text_input("Código de descuento", placeholder="Ej: DESCUENTO123", key=f"cod_in_{n}")
+                        if st.button("Aplicar código", key=f"aplicar_cod_{n}", use_container_width=True):
+                            d, err = validar_descuento(cod)
+                            if err:
+                                st.warning(err)
+                            else:
+                                st.session_state.codigo_descuento = d["codigo"]
+                                st.rerun()
+                    st.divider()
+                    enviar = st.button("CONFIRMAR RESERVA", use_container_width=True, key=f"res_enviar_{n}")
+                    st.caption("Reservas ahora y coordinamos para la entrega")
+
+            if enviar:
                 if not nombre.strip():
                     st.warning("Falta tu nombre y apellido.")
                 elif not correo_valido(mail):
                     st.warning("Escribe un correo válido: ahí te enviaremos la boleta de tu reserva.")
                 else:
                     try:
-                        ok, res = crear_reserva(nombre.strip(), normalizar_instagram(ig), mail.strip(), nota.strip(), carrito)
+                        ok, res = crear_reserva(nombre.strip(), normalizar_instagram(ig), mail.strip(), nota.strip(), carrito,
+                                                codigo=descuento["codigo"] if descuento else None)
                     except Exception as e:
                         ok, res = False, f"No se pudo registrar la reserva. Detalle técnico: {e}"
                     if ok:
@@ -662,6 +851,7 @@ def vista_tienda(cfg):
                         st.session_state.reserva_ok = texto
                         st.session_state.ultima_reserva = res
                         st.session_state.carrito = {}
+                        st.session_state.pop("codigo_descuento", None)
                         st.session_state.res_n = n + 1
                         st.rerun()
                     else:
@@ -707,6 +897,8 @@ def admin_reservas():
                                file_name=f"boleta_reserva_{r['id']:06d}.html", mime="text/html", key=f"bol_{r['id']}")
 
             st.markdown(f"### Total: {money(total)}")
+            if r.get("descuento_codigo"):
+                st.caption(f"Incluye el código {r['descuento_codigo']} ({a_int(r.get('descuento_pct'))}% de descuento)")
 
             if estado != "pendiente":
                 mostrar_pagos(pagos)
@@ -1101,7 +1293,7 @@ def admin_clientes():
         "Correo": df["email"].fillna(""),
         "Compras": df["compras"],
         "Total gastado": df["total_gastado"].map(money),
-        "Última compra": pd.to_datetime(df["ultima_compra"], utc=True).dt.tz_convert("America/Santiago").dt.strftime("%d-%m-%Y"),
+        "Última compra": pd.to_datetime(df["ultima_compra"], utc=True, format="ISO8601").dt.tz_convert("America/Santiago").dt.strftime("%d-%m-%Y"),
     })
     st.dataframe(tabla, hide_index=True, use_container_width=True)
 
@@ -1137,7 +1329,7 @@ def admin_clientes():
         if not compras:
             st.write("Sin compras con comprobante todavía.")
         for k in compras:
-            fecha = pd.to_datetime(k["creado_en"], utc=True).tz_convert("America/Santiago").strftime("%d-%m-%Y")
+            fecha = pd.to_datetime(k["creado_en"], utc=True, format="ISO8601").tz_convert("America/Santiago").strftime("%d-%m-%Y")
             with st.expander(f"Compra N° {k['id']:06d} · {fecha} · {money(k['total'])}"):
                 for it in k["items"]:
                     st.write(f"- {it['cantidad']} × {it['nombre']} (talla {it.get('talla') or 'única'})")
@@ -1146,43 +1338,310 @@ def admin_clientes():
                                    file_name=f"comprobante_{k['id']:06d}.html", mime="text/html", key=f"dl_{k['id']}")
 
 
-def admin_finanzas():
-    st.title("Resumen de Finanzas")
-    ventas = db.table("ventas").select("*").order("creado_en", desc=True).limit(2000).execute().data or []
-    pend = db.table("reservas").select("id", count="exact").eq("estado", "pendiente").execute().count or 0
-    if not ventas:
-        st.info("Todavía no hay ventas registradas.")
-        st.metric("Reservas pendientes", pend)
-        return
-    df = pd.DataFrame(ventas)
-    df["fecha"] = pd.to_datetime(df["creado_en"], utc=True).dt.tz_convert("America/Santiago")
-    hoy = pd.Timestamp.now(tz="America/Santiago").date()
-    h = df[df["fecha"].dt.date == hoy]
-    total_hoy = int(h["total"].sum())
-    prendas = int(h["cantidad"].sum())
-    transf = h.loc[h["metodo_pago"] == "Transferencia", "total"].sum()
-    if "compra_id" in h:
-        mixtos = [int(x) for x in h.loc[h["metodo_pago"] == "Mixto", "compra_id"].dropna().unique()]
+def ventas_desde(corte=None):
+    """Todas las ventas posteriores al último cierre (de a 1000, que es lo máximo que entrega Supabase por consulta)."""
+    filas, ini = [], 0
+    while True:
+        q = db.table("ventas").select("*").order("creado_en", desc=True)
+        if corte:
+            q = q.gt("creado_en", corte)
+        lote = q.range(ini, ini + 999).execute().data or []
+        filas += lote
+        if len(lote) < 1000:
+            return filas
+        ini += 1000
+
+
+def resumen_ventas(df):
+    """Totales de un conjunto de ventas: recaudado, prendas, ventas, efectivo y transferencia."""
+    total = int(df["total"].sum())
+    transf = int(df.loc[df["metodo_pago"] == "Transferencia", "total"].sum())
+    if "compra_id" in df:
+        mixtos = [int(x) for x in df.loc[df["metodo_pago"] == "Mixto", "compra_id"].dropna().unique()]
         if mixtos:
             for k in db.table("compras").select("pagos").in_("id", mixtos).execute().data or []:
                 transf += sum(a_int(pg.get("monto")) for pg in (k.get("pagos") or []) if pg.get("metodo") == "Transferencia")
-    pct = (transf / total_hoy * 100) if total_hoy else 0
+        ventas = int(df["compra_id"].dropna().nunique() + df["compra_id"].isna().sum())
+    else:
+        ventas = len(df)
+    transf = min(transf, total)
+    fechas = pd.to_datetime(df["creado_en"], utc=True, format="ISO8601")
+    return {"total": total, "prendas": int(df["cantidad"].sum()), "ventas": ventas,
+            "transferencia": transf, "efectivo": total - transf,
+            "desde": fechas.min().isoformat(), "hasta": fechas.max().isoformat()}
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total recaudado hoy", money(total_hoy))
-    c2.metric("Prendas vendidas hoy", prendas)
-    c3.metric("% en transferencias", f"{pct:.0f}%")
-    c4.metric("Reservas pendientes", pend)
+
+def fecha_corta(v):
+    return pd.to_datetime(v, utc=True, format="ISO8601").tz_convert("America/Santiago").strftime("%d-%m-%Y")
+
+
+def admin_correcciones(corte):
+    st.subheader("Corregir el total de una venta")
+    st.caption("Úsalo si se cobró mal. El cambio actualiza las finanzas, la ficha del cliente y el comprobante, y queda "
+               "registrado en el historial de correcciones. Solo se pueden corregir ventas de la tanda actual.")
+    try:
+        q = db.table("compras").select("*").order("creado_en", desc=True).limit(300)
+        if corte:
+            q = q.gt("creado_en", corte)
+        compras = q.execute().data or []
+    except Exception as e:
+        st.error(f"No se pudieron leer las ventas. Ejecuta actualizacion_pagos.sql en Supabase. Detalle: {e}")
+        return
+
+    if not compras:
+        st.info("No hay ventas con comprobante en esta tanda.")
+    else:
+        def etiqueta(c):
+            f = pd.to_datetime(c["creado_en"], utc=True, format="ISO8601").tz_convert("America/Santiago").strftime("%d-%m %H:%M")
+            return f"N° {c['id']:06d} · {f} · {c.get('cliente') or 'Sin nombre'} · {money(c['total'])}" + (
+                " (corregida)" if a_int(c.get("ajuste_monto")) else "")
+        k = st.selectbox("Venta", compras, format_func=etiqueta)
+        for it in k["items"]:
+            st.write(f"- {it['cantidad']} × {it['nombre']} (talla {it.get('talla') or 'única'})")
+        pagos = k.get("pagos") or []
+        for pg in pagos:
+            st.write(f"Pago en {pg['metodo'].lower()}: {money(a_int(pg.get('monto')))}")
+        st.markdown(f"**Total actual: {money(k['total'])}**")
+
+        with st.form(f"form_corr_{k['id']}", clear_on_submit=True):
+            nuevo_total = st.number_input("Nuevo total (CLP)", min_value=0, step=500, value=int(a_int(k["total"])))
+            montos = {}
+            if len(pagos) > 1:
+                st.caption("Esta venta tiene varios pagos: indica cuánto corresponde a cada uno (deben sumar el nuevo total).")
+                for i, pg in enumerate(pagos):
+                    montos[i] = st.number_input(f"Monto en {pg['metodo'].lower()}", min_value=0, step=500,
+                                                value=int(a_int(pg.get("monto"))), key=f"corr_pago_{k['id']}_{i}")
+            motivo = st.text_input("Motivo de la corrección *", placeholder="Ej: se cobró de más")
+            ok = st.form_submit_button("Guardar corrección", use_container_width=True)
+        if ok:
+            if not motivo.strip():
+                st.warning("Escribe el motivo de la corrección.")
+            elif a_int(nuevo_total) == a_int(k["total"]):
+                st.info("El nuevo total es igual al actual: no hay nada que cambiar.")
+            elif len(pagos) > 1 and sum(a_int(m) for m in montos.values()) != a_int(nuevo_total):
+                st.error(f"Los pagos deben sumar el nuevo total. Ahora suman {money(sum(a_int(m) for m in montos.values()))}.")
+            else:
+                err = corregir_total_venta(k, nuevo_total, montos, motivo.strip(), corte)
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state.flash = f"Total de la venta N° {k['id']:06d} corregido"
+                    st.rerun()
+
+    st.markdown("**Historial de correcciones**")
+    try:
+        hist = db.table("correcciones_venta").select("*").order("creado_en", desc=True).limit(100).execute().data or []
+    except Exception:
+        st.caption("Para registrar correcciones, ejecuta actualizacion_correcciones.sql en Supabase.")
+        return
+    if not hist:
+        st.caption("Todavía no se ha corregido ninguna venta.")
+        return
+    st.dataframe(pd.DataFrame({
+        "Fecha": [pd.to_datetime(h["creado_en"], utc=True, format="ISO8601").tz_convert("America/Santiago").strftime("%d-%m-%Y %H:%M") for h in hist],
+        "Venta": [f"N° {h['compra_id']:06d}" for h in hist],
+        "Cliente": [h.get("cliente") or "" for h in hist],
+        "Total anterior": [money(h["total_anterior"]) for h in hist],
+        "Total nuevo": [money(h["total_nuevo"]) for h in hist],
+        "Diferencia": [money_signado(a_int(h["total_nuevo"]) - a_int(h["total_anterior"])) for h in hist],
+        "Motivo": [h.get("motivo") or "" for h in hist],
+    }), hide_index=True, use_container_width=True)
+
+
+def admin_finanzas():
+    st.title("Resumen de Finanzas")
+    tandas_ok = True
+    try:
+        cierres = db.table("tandas_finanzas").select("*").order("cerrada_en", desc=True).execute().data or []
+    except Exception as e:
+        cierres, tandas_ok = [], False
+        st.error(f"Falta crear la tabla del historial: ejecuta actualizacion_tandas.sql en Supabase. Detalle: {e}")
+    corte = cierres[0]["hasta"] if cierres else None          # la tanda actual cuenta desde el último cierre
+
+    ventas = ventas_desde(corte)
+    pend = db.table("reservas").select("id", count="exact").eq("estado", "pendiente").execute().count or 0
+    hay_ventas = bool(ventas)
+
+    if not hay_ventas:
+        st.info("Todavía no hay ventas en esta tanda." if corte else "Todavía no hay ventas registradas.")
+        st.metric("Reservas pendientes", pend)
+    else:
+        df = pd.DataFrame(ventas)
+        df["fecha"] = pd.to_datetime(df["creado_en"], utc=True, format="ISO8601").dt.tz_convert("America/Santiago")
+        r = resumen_ventas(df)
+        hoy = pd.Timestamp.now(tz="America/Santiago").date()
+        total_hoy = int(df.loc[df["fecha"].dt.date == hoy, "total"].sum())
+        pct = (r["transferencia"] / r["total"] * 100) if r["total"] else 0
+
+        st.caption(f"Tanda actual: desde el {fecha_corta(r['desde'])}"
+                   + (f" (después del cierre del {fecha_corta(cierres[0]['cerrada_en'])})" if cierres else ""))
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total recaudado", money(r["total"]))
+        c2.metric("Prendas vendidas", r["prendas"])
+        c3.metric("Ventas realizadas", r["ventas"])
+        c4.metric("% en transferencias", f"{pct:.0f}%")
+        c5, c6, c7, c8 = st.columns(4)
+        c5.metric("Recaudado hoy", money(total_hoy))
+        c6.metric("En efectivo", money(r["efectivo"]))
+        c7.metric("En transferencia", money(r["transferencia"]))
+        c8.metric("Reservas pendientes", pend)
+
+        st.divider()
+        st.subheader("Ventas por día")
+        por_dia = df.groupby(df["fecha"].dt.date)["total"].sum().sort_index().tail(30)
+        st.bar_chart(por_dia)
+
+        st.subheader("Últimas ventas")
+        tabla = df[["fecha", "nombre_producto", "cantidad", "total", "metodo_pago", "cliente"]].head(30).copy()
+        tabla["fecha"] = tabla["fecha"].dt.strftime("%d-%m %H:%M")
+        st.dataframe(tabla, hide_index=True, use_container_width=True)
+
+        st.divider()
+        admin_correcciones(corte)
 
     st.divider()
-    st.subheader("Ventas por día (últimos 14 días)")
-    por_dia = df.groupby(df["fecha"].dt.date)["total"].sum().sort_index().tail(14)
-    st.bar_chart(por_dia)
+    st.subheader("Cerrar tanda")
+    st.caption("Guarda el resumen de esta tanda en el historial y deja las finanzas en cero para empezar la siguiente. "
+               "No se borra ninguna venta, cliente ni producto.")
+    tn = st.session_state.setdefault("tanda_n", 0)             # cambia al cerrar, para limpiar los campos
+    nombre_tanda = st.text_input("Nombre de la tanda (opcional)", placeholder="Ej: Drop 01", key=f"tanda_nombre_{tn}")
+    confirmar = st.checkbox("Confirmo que quiero resetear las finanzas y guardar esta tanda en el historial", key=f"tanda_ok_{tn}")
+    if hay_ventas:
+        st.caption(f"Se guardará: {money(r['total'])} · {r['prendas']} prendas · {r['ventas']} ventas "
+                   f"· del {fecha_corta(r['desde'])} al {fecha_corta(r['hasta'])}")
+    if st.button("RESETEAR FINANZAS Y GUARDAR HISTORIAL", use_container_width=True, key=f"tanda_btn_{tn}",
+                 disabled=not (confirmar and hay_ventas and tandas_ok)):
+        try:
+            db.table("tandas_finanzas").insert({
+                "nombre": nombre_tanda.strip() or None, "desde": r["desde"], "hasta": r["hasta"],
+                "total": r["total"], "prendas": r["prendas"], "ventas": r["ventas"],
+                "efectivo": r["efectivo"], "transferencia": r["transferencia"],
+            }).execute()
+            st.session_state.tanda_n = tn + 1
+            st.session_state.flash = "Tanda cerrada y guardada en el historial"
+            st.rerun()
+        except Exception as e:
+            st.error(f"No se pudo guardar la tanda. Detalle técnico: {e}")
 
-    st.subheader("Últimas ventas")
-    tabla = df[["fecha", "nombre_producto", "cantidad", "total", "metodo_pago", "cliente"]].head(30).copy()
-    tabla["fecha"] = tabla["fecha"].dt.strftime("%d-%m %H:%M")
+    st.divider()
+    st.subheader("Historial de tandas")
+    if not cierres:
+        st.info("Todavía no hay tandas cerradas.")
+        return
+    h1, h2 = st.columns(2)
+    h1.metric("Tandas cerradas", len(cierres))
+    h2.metric("Total de todas las tandas", money(sum(a_int(c["total"]) for c in cierres)))
+    tabla = pd.DataFrame({
+        "Tanda": [c.get("nombre") or f"Tanda {len(cierres) - i}" for i, c in enumerate(cierres)],
+        "Desde": [fecha_corta(c["desde"]) for c in cierres],
+        "Hasta": [fecha_corta(c["hasta"]) for c in cierres],
+        "Total recaudado": [money(c["total"]) for c in cierres],
+        "Prendas": [a_int(c["prendas"]) for c in cierres],
+        "Ventas": [a_int(c["ventas"]) for c in cierres],
+        "Efectivo": [money(c["efectivo"]) for c in cierres],
+        "Transferencia": [money(c["transferencia"]) for c in cierres],
+        "% transf.": [f"{(a_int(c['transferencia']) / a_int(c['total']) * 100) if a_int(c['total']) else 0:.0f}%" for c in cierres],
+        "Cerrada el": [fecha_corta(c["cerrada_en"]) for c in cierres],
+    })
     st.dataframe(tabla, hide_index=True, use_container_width=True)
+
+    deshacer = st.checkbox("Quiero deshacer el último cierre (sus ventas vuelven a contarse en la tanda actual)", key=f"tanda_undo_{tn}")
+    if st.button("Deshacer último cierre", disabled=not deshacer, key=f"tanda_undo_btn_{tn}"):
+        db.table("tandas_finanzas").delete().eq("id", cierres[0]["id"]).execute()
+        st.session_state.tanda_n = tn + 1
+        st.session_state.flash = "Último cierre deshecho"
+        st.rerun()
+
+
+def admin_descuentos():
+    st.subheader("Códigos de descuento")
+    st.caption("Los clientes los escriben en su carrito. Cada código funciona de forma independiente del botón 'Guardar diseño'.")
+    try:
+        codigos = db.table("descuentos").select("*").order("creado_en", desc=True).execute().data or []
+    except Exception as e:
+        st.error(f"No se pudieron leer los códigos. Ejecuta actualizacion_descuentos.sql en Supabase. Detalle: {e}")
+        return
+
+    if codigos:
+        def nz(v):
+            return None if pd.isna(v) else v
+        df = pd.DataFrame({
+            "id": [c["id"] for c in codigos],
+            "Código": [c["codigo"] for c in codigos],
+            "Descuento %": [c["porcentaje"] for c in codigos],
+            "Vence (vacío = sin fecha)": [pd.to_datetime(c["vence"]).date() if c.get("vence") else None for c in codigos],
+            "Cupos (vacío = ilimitados)": pd.array([c.get("cupos_total") for c in codigos], dtype="Int64"),
+            "Usos": [a_int(c.get("usos")) for c in codigos],
+            "Activo": [bool(c.get("activo", True)) for c in codigos],
+        })
+        editado = st.data_editor(
+            df, hide_index=True, use_container_width=True, disabled=["id", "Usos"], key="ed_descuentos",
+            column_config={
+                "id": None,
+                "Descuento %": st.column_config.NumberColumn(min_value=1, max_value=100, step=1),
+                "Vence (vacío = sin fecha)": st.column_config.DateColumn(format="DD-MM-YYYY"),
+                "Cupos (vacío = ilimitados)": st.column_config.NumberColumn(min_value=1, step=1),
+            })
+        if st.button("Guardar cambios de los códigos"):
+            try:
+                n = 0
+                for i in df.index:
+                    if any(nz(df.loc[i, c]) != nz(editado.loc[i, c]) for c in df.columns):
+                        r = editado.loc[i]
+                        vence = nz(r["Vence (vacío = sin fecha)"])
+                        cupos = nz(r["Cupos (vacío = ilimitados)"])
+                        db.table("descuentos").update({
+                            "codigo": re.sub(r"\s+", "", str(r["Código"])).upper(),
+                            "porcentaje": min(max(a_int(r["Descuento %"]), 1), 100),
+                            "vence": pd.to_datetime(vence).date().isoformat() if vence is not None else None,
+                            "cupos_total": a_int(cupos) if cupos is not None else None,
+                            "activo": bool(r["Activo"]),
+                        }).eq("id", int(r["id"])).execute()
+                        n += 1
+                st.session_state.flash = f"{n} código(s) actualizado(s)"
+                st.rerun()
+            except Exception as e:
+                st.error(f"No se pudo guardar. Detalle técnico: {e}")
+        with st.form("form_borrar_descuento", clear_on_submit=True):
+            elegido = st.selectbox("Eliminar un código", codigos, format_func=lambda c: f"{c['codigo']} ({c['porcentaje']}%)")
+            ok_del = st.form_submit_button("Eliminar código")
+        if ok_del:
+            db.table("descuentos").delete().eq("id", elegido["id"]).execute()
+            st.session_state.flash = "Código eliminado"
+            st.rerun()
+    else:
+        st.info("Todavía no hay códigos de descuento.")
+
+    st.markdown("**Crear un código nuevo**")
+    nd = st.session_state.setdefault("desc_n", 0)          # cambia al crear, para limpiar los campos
+    hoy = pd.Timestamp.now(tz="America/Santiago").date()
+    d1, d2 = st.columns(2)
+    codigo = d1.text_input("Nombre del código", placeholder="DESCUENTO123", key=f"dc_{nd}")
+    pct = d2.number_input("Porcentaje de descuento (%)", min_value=1, max_value=100, value=10, step=1, key=f"dp_{nd}")
+    duracion = st.radio("Duración", ["Sin fecha de término", "Hasta una fecha"], horizontal=True, key=f"dd_{nd}")
+    vence = None
+    if duracion == "Hasta una fecha":
+        vence = st.date_input("Válido hasta (inclusive)", value=hoy + timedelta(days=30), min_value=hoy, key=f"dv_{nd}")
+    usos = st.radio("Usos", ["Ilimitados", "Con cupos"], horizontal=True, key=f"du_{nd}")
+    cupos = None
+    if usos == "Con cupos":
+        cupos = st.number_input("Cantidad de usos disponibles", min_value=1, value=10, step=1, key=f"dcu_{nd}")
+    if st.button("Crear código", key=f"crear_desc_{nd}"):
+        limpio = re.sub(r"\s+", "", codigo).upper()
+        if not limpio:
+            st.warning("Escribe el nombre del código.")
+        else:
+            try:
+                db.table("descuentos").insert({
+                    "codigo": limpio, "porcentaje": int(pct),
+                    "vence": vence.isoformat() if vence else None,
+                    "cupos_total": int(cupos) if cupos else None, "activo": True,
+                }).execute()
+                st.session_state.desc_n = nd + 1
+                st.session_state.flash = f"Código {limpio} creado"
+                st.rerun()
+            except Exception as e:
+                st.error(f"No se pudo crear el código (¿ya existe uno con ese nombre?). Detalle técnico: {e}")
 
 
 def admin_diseno(cfg):
@@ -1243,6 +1702,9 @@ def admin_diseno(cfg):
                 st.rerun()
         except Exception as e:
             st.error(f"No se pudo guardar. Si dice que falta una columna, ejecuta actualizacion_diseno.sql en Supabase. Detalle: {e}")
+
+    st.divider()
+    admin_descuentos()
 
 
 # ----------------------------------------------------------------------
