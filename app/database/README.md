@@ -1,22 +1,35 @@
-# Backend y Base de Datos - Scene One
+# Base de datos
 
-Esta carpeta contiene toda la lógica de conexión y gestión de datos entre la aplicación web y nuestro servidor en **Supabase**.
+PostgreSQL en [Supabase](https://supabase.com). Modelo y diccionario en [`docs/03-modelo-de-datos.md`](../docs/03-modelo-de-datos.md).
 
-## Propósito de la Carpeta
-Aquí se alojan los scripts, diagramas y modelos encargados de:
-* Establecer un puente seguro con la base de datos en la nube.
-* Realizar consultas en tiempo real (lectura de inventario, registro de ventas, etc.).
-* Guardar los modelos relacionales y diagramas de arquitectura del proyecto.
+## ¿Qué archivo uso?
 
-## Archivos Principales
-* `conexion.py`: Contiene la configuración del cliente de Supabase y las funciones puente (ej: `obtener_inventario()`).
-* *(Aquí guardaremos las fotos de los diagramas de base de datos)*.
+| Situación | Qué ejecutar |
+|---|---|
+| Proyecto de Supabase **nuevo** | [`schema.sql`](schema.sql) |
+| Quiero datos de ejemplo para probar o presentar | [`datos_demo.sql`](datos_demo.sql), **una sola vez**, después de `schema.sql` |
+| Ya tengo una base de una versión anterior | Los archivos de [`migraciones/`](migraciones/) que aún no hayas aplicado, **en orden** |
 
-## Estructura de Tablas (Supabase)
-El proyecto se conecta con las siguientes entidades principales en la nube:
-1. **Inventario:** Control de stock, precios y tallas (`nombre`, `precio`, `stock`, `tallas`).
-2. **Clientes** *(Próximamente)*: Registro de compradores y sus redes sociales (Instagram).
-3. **Ventas** *(Próximamente)*: Historial de transacciones, carrito de compras y comprobantes de pago.
+Todo se ejecuta pegando el contenido en **Supabase > SQL Editor > Run**.
 
-> **AVISO DE SEGURIDAD IMPORTANTE:** 
-> Por motivos de ciberseguridad, las credenciales de acceso (`SUPABASE_URL` y `SUPABASE_KEY`) **NUNCA** deben escribirse en los archivos de esta carpeta ni subirse a GitHub. Toda llave secreta se maneja exclusivamente de forma local a través del archivo `.streamlit/secrets.toml`.
+## Migraciones
+
+Son los cambios incrementales, en el orden en que se aplicaron durante el desarrollo. Cada una puede ejecutarse más de una vez sin
+problema (`if not exists`).
+
+| Archivo | Qué agrega |
+|---|---|
+| `001_categorias_y_tallas.sql` | Tabla `opciones` con las categorías y tallas de los menús |
+| `002_diseno_textos_y_redes.sql` | Columnas del diseño: nombre, textos, Instagram y TikTok |
+| `003_clientes.sql` | Tabla `clientes` |
+| `004_instagram.sql` | Columna `instagram` en reservas y clientes, y la clave que identifica al cliente |
+| `005_compras_pagos_comprobantes.sql` | Tabla `compras` y las columnas de pagos |
+| `006_codigos_de_descuento.sql` | Tabla `descuentos` y las columnas de descuento |
+| `007_tandas_de_finanzas.sql` | Tabla `tandas_finanzas` (historial de cierres) |
+| `008_correcciones_de_ventas.sql` | Tabla `correcciones_venta` y la columna de ajuste |
+
+> `schema.sql` ya incluye el resultado de todas las migraciones, sin las columnas que quedaron en desuso (como el teléfono del cliente).
+
+## Si aparece "could not find the table"
+
+La API de Supabase guarda el esquema en caché. Ejecuta `notify pgrst, 'reload schema';` y vuelve a cargar la aplicación.
