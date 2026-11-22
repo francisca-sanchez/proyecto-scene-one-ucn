@@ -974,6 +974,7 @@ def admin_pos():
     st.title("Punto de Venta")
     mostrar_ultimo_comprobante()
     items = st.session_state.setdefault("pos_items", [])
+    n = st.session_state.setdefault("pos_n", 0)        # cambia al registrar, para limpiar el formulario
     prods = [p for p in listar_productos() if p["stock"] > 0]
     if not prods:
         st.warning("No hay productos con stock. Agrega inventario primero.")
@@ -1010,14 +1011,42 @@ def admin_pos():
             if b.button("Quitar", key=f"pos_del_{idx}"):
                 del items[idx]
                 st.rerun()
-        total = sum(i["precio"] * i["cantidad"] for i in items)
+        subtotal = sum(i["precio"] * i["cantidad"] for i in items)
+
+        # Código de descuento: se vuelve a comprobar cada vez (fecha, cupos y si sigue activo)
+        descuento, monto_desc, codigo_perdido = None, 0, False
+        if items and st.session_state.get("pos_codigo"):
+            descuento, err = validar_descuento(st.session_state["pos_codigo"])
+            if err:
+                st.session_state.pop("pos_codigo", None)
+                st.warning(f"Se quitó el código de descuento: {err}")
+                descuento, codigo_perdido = None, True
+            else:
+                monto_desc = int(round(subtotal * descuento["porcentaje"] / 100))
+        total = subtotal - monto_desc
+
+        if items:
+            if descuento:
+                st.write(f"Subtotal: {money(subtotal)}")
+                st.write(f"Descuento {descuento['codigo']} ({descuento['porcentaje']}%): -{money(monto_desc)}")
+                if st.button("Quitar código de descuento", key=f"pos_quitar_cod_{n}"):
+                    st.session_state.pop("pos_codigo", None)
+                    st.rerun()
+            else:
+                cod_in = st.text_input("Código de descuento (opcional)", placeholder="Ej: DESCUENTO123", key=f"pos_cod_in_{n}")
+                if st.button("Aplicar código", key=f"pos_aplicar_cod_{n}"):
+                    d_ok, err = validar_descuento(cod_in)
+                    if err:
+                        st.warning(err)
+                    else:
+                        st.session_state.pos_codigo = d_ok["codigo"]
+                        st.rerun()
         st.markdown(f"### Total a cobrar: {money(total)}")
 
     if not items:
         return
     st.divider()
     st.subheader("Datos del cliente y pago")
-    n = st.session_state.setdefault("pos_n", 0)        # cambia al registrar, para limpiar el formulario
     d1, d2, d3 = st.columns(3)
     nombre = d1.text_input("Nombre y apellido *", key=f"pos_nombre_{n}")
     ig = d2.text_input("Usuario de Instagram (opcional)", placeholder="@usuario", key=f"pos_ig_{n}")
@@ -1035,17 +1064,35 @@ def admin_pos():
             st.warning("Falta el nombre del cliente.")
         elif metodo == "Transferencia" and not comp:
             st.warning("Sube la captura del comprobante de la transferencia.")
+        elif codigo_perdido:                               # el código dejó de valer: no se cobra sin avisar
+            st.error("El código de descuento dejó de valer. Revisa el nuevo total y vuelve a presionar el botón.")
         else:
+            if descuento:                                  # se comprueba otra vez justo antes de cobrar
+                descuento, err_desc = validar_descuento(descuento["codigo"])
+                if err_desc:
+                    st.session_state.pop("pos_codigo", None)
+                    st.error(f"El código de descuento ya no es válido: {err_desc}")
+                    return
+                monto_desc = int(round(subtotal * descuento["porcentaje"] / 100))
+                total = subtotal - monto_desc
             try:
                 url = subir_imagen(comp, "comprobantes") if metodo == "Transferencia" else None
             except Exception as e:
                 st.error(f"No se pudo subir el comprobante. Detalle técnico: {e}")
                 return
             pagos = [{"metodo": metodo, "monto": total, "url": url, "fecha": ahora(), "verificado": True, "origen": "admin"}]
-            compra, err = finalizar_compra(items, nombre.strip(), ig, mail.strip(), None, pagos, "punto_de_venta")
+            compra, err = finalizar_compra(items, nombre.strip(), ig, mail.strip(), None, pagos, "punto_de_venta",
+                                           descuento={"codigo": descuento["codigo"], "pct": descuento["porcentaje"],
+                                                      "monto": monto_desc} if descuento else None)
             if err:
                 st.error(err)
             else:
+                if descuento:                              # cada venta con código gasta un cupo
+                    try:
+                        db.table("descuentos").update({"usos": a_int(descuento.get("usos")) + 1}).eq("id", descuento["id"]).execute()
+                    except Exception:
+                        pass
+                st.session_state.pop("pos_codigo", None)
                 st.session_state.pos_items = []
                 st.session_state.pos_n = n + 1
                 st.session_state.ultimo_comprobante = compra["id"]
@@ -1377,8 +1424,6 @@ def fecha_corta(v):
 
 def admin_correcciones(corte):
     st.subheader("Corregir el total de una venta")
-    st.caption("Úsalo si se cobró mal. El cambio actualiza las finanzas, la ficha del cliente y el comprobante, y queda "
-               "registrado en el historial de correcciones. Solo se pueden corregir ventas de la tanda actual.")
     try:
         q = db.table("compras").select("*").order("creado_en", desc=True).limit(300)
         if corte:
@@ -1501,8 +1546,6 @@ def admin_finanzas():
 
     st.divider()
     st.subheader("Cerrar tanda")
-    st.caption("Guarda el resumen de esta tanda en el historial y deja las finanzas en cero para empezar la siguiente. "
-               "No se borra ninguna venta, cliente ni producto.")
     tn = st.session_state.setdefault("tanda_n", 0)             # cambia al cerrar, para limpiar los campos
     nombre_tanda = st.text_input("Nombre de la tanda (opcional)", placeholder="Ej: Drop 01", key=f"tanda_nombre_{tn}")
     confirmar = st.checkbox("Confirmo que quiero resetear las finanzas y guardar esta tanda en el historial", key=f"tanda_ok_{tn}")
@@ -1646,7 +1689,6 @@ def admin_descuentos():
 
 def admin_diseno(cfg):
     st.title("Diseño de la App")
-    st.info("Cambia solo lo que quieras: lo que no toques se queda como está. Presiona 'Guardar diseño' al final.")
     nuevo = dict(cfg)
 
     st.subheader("Colores")
